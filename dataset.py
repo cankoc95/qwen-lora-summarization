@@ -47,7 +47,7 @@ class SamSumDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        """ 
+        """
         Get a single item in the dataset at the given index.
 
         Raw data contains 'dialogue' and 'summary' texts where dialogue is what the human/user inputs and summary is what the llm should predict.
@@ -61,7 +61,7 @@ class SamSumDataset(Dataset):
         # messages_prefix contains system + user section where messages_full has system + user + assistant
         messages_prefix, messages_full = SamSumDataset.get_example(human=dialogue, assistant=summary)
 
-        # Token ids for prefix. Prefix doesn't contain labels (summary). 
+        # Token ids for prefix. Prefix doesn't contain labels (summary).
         # add_generation_prompt=True because prefix does NOT contain assistant token.
         prefix_ids = self.tokenizer.apply_chat_template(messages_prefix, add_generation_prompt=True, return_tensors="pt")[0]
 
@@ -70,13 +70,13 @@ class SamSumDataset(Dataset):
         full_ids = self.tokenizer.apply_chat_template(messages_full, add_generation_prompt=False, return_tensors="pt")[0]
 
         # Truncate the sequence to the maximum sequence length
-        if full_ids.shape[0] > self.max_seq_len:    
+        if full_ids.shape[0] > self.max_seq_len:
             full_ids = full_ids[:self.max_seq_len]
 
         # Prefix length is where labels should be ignored
         prefix_len = min(prefix_ids.shape[0], full_ids.shape[0])
         labels = full_ids.clone()
-        labels[:prefix_len] = -100  # ignores system + user part. 
+        labels[:prefix_len] = -100  # ignores system + user part.
         attention_mask = torch.ones_like(full_ids, dtype=torch.long)
 
         return {"input_ids": full_ids,
@@ -89,7 +89,7 @@ class SamSumDataset(Dataset):
         system_var = HF_SYSTEM_MARKER
         user_var = HF_USER_MARKER
         assistant_var = HF_ASSISTANT_MARKER
-        
+
         system_prompt = (
             "You are a helpful assistant that summarizes given text into brief, clear summaries."
         )
@@ -110,7 +110,7 @@ def collate_fn(batch, pad_token_id):
     """
     Samsum collate function.
     Given a list of dicts (batch) where each dict is a sample returned by the dataset.
-    Pads each each element in the batch such that all have the same length 
+    Pads each each element in the batch such that all have the same length
 
     Each element in the batch will look like:
     input_ids:       [batch_size, max_len]
@@ -124,10 +124,14 @@ def collate_fn(batch, pad_token_id):
     # Different batches can have different lengths.
     max_len = max([item["input_ids"].shape[0] for item in batch])
 
+    # Add pad tokens for rows that are shorter than max_len
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
+    # Prepare attention mask. mask = 0 means the token is a pad token and mask = 1 is a real token.
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+    # Prepare labels. Use -100 for the pad tokens since we want CE loss to ignore it.
     labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
 
+    # Iterate over each input in the batch and copy the inputs into [0:max_len]
     for i, item in enumerate(batch):
         # Remember, input_ids, attention_mask and labels already have same length = input_ids.shape[0]
         # This was guaranteed in the dataset setup.

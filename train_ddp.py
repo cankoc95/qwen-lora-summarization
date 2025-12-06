@@ -6,25 +6,29 @@ from dataset import SamSumDataset, collate_fn
 import os
 import pathlib
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from datasets import load_dataset, load_from_disk
 
 # Hyperparameters
-per_gpu_batch_size = 1 # Use 1 for debugging on mac
+per_gpu_batch_size = 8 # Use 1 for debugging on mac
 grad_accumulation_steps = 8  # Set to 1 to disable it. Helps simulate a larger global batch = (per_gpu_batch * world_size * grad_accumulation_step)
 max_seq_len = 1024  # Use 512 for debugging on mac
-num_epochs = 2
-learning_rate = 2e-4
+num_epochs = 10
+learning_rate = 1e-5
 weight_decay = 0.01
 max_grad_norm = 1
+eval_interval = 100  # Steps interval for evaluating.
 
 # Inits
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-data_dir = pathlib.Path("data")
+script_dir = pathlib.Path(__file__).parent.resolve()
+data_dir = script_dir / "data"
+checkpoint_dir = script_dir / "checkpoints"
 
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -52,12 +56,11 @@ if ddp:
     # rank between [0, 7]
     # world size 8
     # local rank between [0, 3]
-
+    dist.init_process_group(backend=backend)
     rank = int(os.environ["RANK"])  # Global index of the process [0, world_size - 1]
     world_size = int(os.environ["WORLD_SIZE"]) # Total number of processes/GPUs (N)
     local_rank = int(os.environ["LOCAL_RANK"]) # GPU index local to the node [0, n-1]
     device = f'cuda:{local_rank}'
-    dist.init_process_group(backend=backend)
     torch.cuda.set_device(device)
     master_process = rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = rank # each process gets a different seed
@@ -68,7 +71,7 @@ else:
 torch.manual_seed(1719 + seed_offset)
 
 @torch.no_grad()
-def evaluate(model, val_data_loader, device, epoch, world_size=None):
+def evaluate(model, val_data_loader, device):
     """ Eval function to evaluate model on the validation dataset"""
     model.eval()
     total_loss = 0.0
@@ -85,20 +88,29 @@ def evaluate(model, val_data_loader, device, epoch, world_size=None):
 
     if ddp:
         # Average all the losses from all gpus/processes
-        avg_loss = torch.tensor(total_loss / max(steps, 1), device=device)
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-        avg_loss = (avg_loss / world_size).item()
+        # Compute total loss and total steps across all gpus. Get average loss by dividing total loss / total steps.
+        # This is a better way to get average loss in case data shards wasn't evenly distributed across all gpus.
+        loss_tensor = torch.tensor(total_loss, device=device)
+        steps_tensor = torch.tensor(steps, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(steps_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = (loss_tensor / steps_tensor).item()
     else:
         avg_loss = total_loss / steps
 
-    if master_process:
-        print(f"Epoch {epoch}, validation loss {avg_loss:.4f}")
+    model.train()
+    return avg_loss
 
+def get_scheduler(num_epochs, training_data_loader, optimizer):
+    num_training_steps = len(training_data_loader) * num_epochs
+    num_warmup_steps = int(0.05 * num_training_steps)
+    return get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
-def train_one_epoch(model, optimizer, train_data_loader, device, epoch, grad_acc_steps, world_size=None):
+def train_one_epoch(model, optimizer, scheduler, train_data_loader, val_data_loader, device, epoch, grad_acc_steps, world_size=None):
     # Put model to training mode
     model.train()
     total_loss = 0.0
+    interval_loss = 0.0
     total_steps = 0
 
     for step, batch in enumerate(train_data_loader):
@@ -110,8 +122,8 @@ def train_one_epoch(model, optimizer, train_data_loader, device, epoch, grad_acc
                         labels=batch["labels"]
                         )
         loss = outputs.loss
-
-        # Devide the loss by the gradient accumulation steps before calling backward.
+        interval_loss += loss.item() # Unscaled loss. Needed for printing the losses later.
+        # Divide the loss by the gradient accumulation steps before calling backward.
         # This is to ensure that we correctly simulate a larger batch size (CE loss does an average over the batch dimension).
         loss = loss / grad_acc_steps
         loss.backward()
@@ -120,25 +132,39 @@ def train_one_epoch(model, optimizer, train_data_loader, device, epoch, grad_acc
         if (step + 1) % grad_acc_steps == 0:
             clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item()
+        total_loss += loss.item() # Scaled down
         total_steps += 1
 
-        if master_process and (step + 1) % 50 == 0:
-            print(f"Epoch {epoch}, step {step + 1}/{len(train_data_loader)}, train loss {loss.item():.4f}")
+        if (step + 1) % eval_interval == 0:
+            # Evaluate validation loss
+            avg_val_loss = evaluate(model=model, val_data_loader=val_data_loader, device=device)
 
-    if ddp:
-        # Average training loss across all gpus/processes.
-        avg_loss = torch.tensor(total_loss / max(total_steps, 1), device=device)
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-        avg_loss = (avg_loss / world_size).item()
-    else:
-        avg_loss = total_loss / total_steps
+            # Evaluate train loss across all gpus.
+            with torch.no_grad():
+                avg_train_loss = torch.tensor(interval_loss / eval_interval, device=device)
+                if ddp:
+                    dist.all_reduce(avg_train_loss, op=dist.ReduceOp.SUM)
+                    avg_train_loss = (avg_train_loss / world_size).item()
+                else:
+                    avg_train_loss = avg_train_loss.item()
+                interval_loss = 0.0
 
-    if master_process:
-        print(f"Finished epoch {epoch}, average train loss (across {world_size} GPUs) {avg_loss:.4f}")
+            if master_process:
+                print(f"Epoch {epoch}, step {step + 1}/{len(train_data_loader)}, train loss {avg_train_loss:.4f}, val loss {avg_val_loss:.4f}")
 
+    # if ddp:
+    #     # Average training loss across all gpus/processes.
+    #     avg_loss = torch.tensor(total_loss / max(total_steps, 1), device=device)
+    #     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+    #     avg_loss = (avg_loss / world_size).item()
+    # else:
+    #     avg_loss = total_loss / total_steps
+
+    # if master_process:
+    #     print(f"Finished epoch {epoch}, average train loss (across {world_size} GPUs) {avg_loss:.4f}")
 
 def main():
     print(f"Model name {model_name}, device {device} and dtype {ptdtype}")
@@ -195,29 +221,33 @@ def main():
     if ddp:
         model = DDP(model, device_ids=[local_rank])
 
+    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # Scheduler
+    scheduler = get_scheduler(num_epochs=num_epochs, training_data_loader=train_dl, optimizer=optimizer)
 
     print("Starting training...")
     for epoch in range(1, num_epochs + 1):
         if ddp:
             # Makes sure the shuffling is done differently in each epoch.
             train_sampler.set_epoch(epoch)
-            train_one_epoch(model=model, optimizer=optimizer, train_data_loader=train_dl, device=device, epoch=epoch, grad_acc_steps=grad_accumulation_steps, world_size=world_size)
-            evaluate(model=model, val_data_loader=val_dl, device=device, epoch=epoch, world_size=world_size)
+            train_one_epoch(model=model, optimizer=optimizer, scheduler=scheduler, train_data_loader=train_dl, val_data_loader=val_dl, device=device, epoch=epoch, grad_acc_steps=grad_accumulation_steps, world_size=world_size)
         else:
-            train_one_epoch(model=model, optimizer=optimizer, train_data_loader=train_dl, device=device, epoch=epoch, grad_acc_steps=grad_accumulation_steps)
-            evaluate(model=model, val_data_loader=val_dl, device=device, epoch=epoch, world_size=world_size)
+            train_one_epoch(model=model, optimizer=optimizer, scheduler=scheduler, train_data_loader=train_dl, val_data_loader=val_dl, device=device, epoch=epoch, grad_acc_steps=grad_accumulation_steps)
 
         if master_process:
-            save_dir = f"qwen2.5-0.5b-samsum-lora-ddp-epoch{epoch}"
-            # Make sure to unwrap DDP by calling .module
-            model.module.save_pretrained(save_dir)
+            save_dir = f"{checkpoint_dir}/qwen2.5-0.5b-samsum-lora-ddp-epoch{epoch}"
+            if ddp:
+                # Make sure to unwrap DDP by calling .module
+                model.module.save_pretrained(save_dir)
+            else:
+                model.save_pretrained(save_dir)
             # No change to the tokenizer, but by convention it's simpler to save everything together.
             tokenizer.save_pretrained(save_dir)
 
     if ddp:
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
