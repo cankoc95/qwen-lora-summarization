@@ -15,10 +15,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from datasets import load_dataset, load_from_disk
 
 # Hyperparameters
-per_gpu_batch_size = 8 # Use 1 for debugging on mac
+per_gpu_batch_size = 16 # Use 1 for debugging on mac
 grad_accumulation_steps = 8  # Set to 1 to disable it. Helps simulate a larger global batch = (per_gpu_batch * world_size * grad_accumulation_step)
 max_seq_len = 1024  # Use 512 for debugging on mac
-num_epochs = 10
+num_epochs = 20
 learning_rate = 1e-5
 weight_decay = 0.01
 max_grad_norm = 1
@@ -245,6 +245,7 @@ def main():
                 model.save_pretrained(save_dir)
             # No change to the tokenizer, but by convention it's simpler to save everything together.
             tokenizer.save_pretrained(save_dir)
+            print(f"Saved model and tokenizer to {save_dir}")
 
     if ddp:
         dist.destroy_process_group()
